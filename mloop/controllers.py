@@ -4,17 +4,19 @@ Module of all the controllers used in M-LOOP. The controllers, as the name sugge
 from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
+import os
 import datetime
 from importlib import import_module
+import logging
+import traceback
+
+import numpy as np
+
 from mloop import __version__
 import mloop.utilities as mlu
 import mloop.learners as mll
 import mloop.interfaces as mli
-import logging
-import os
 
-controller_dict = {'random':1,'nelder_mead':2,'gaussian_process':3,'differential_evolution':4,'neural_net':5}
-number_of_controllers = len(controller_dict)
 default_controller_archive_filename = 'controller_archive'
 default_controller_archive_file_type = 'txt'
 
@@ -80,29 +82,76 @@ def create_controller(interface,
 
 class Controller():
     '''
-    Abstract class for controllers. The controller controls the entire M-LOOP process. The controller for each algorithm all inherit from this class. The class stores a variety of data which all algorithms use and also all of the archiving and saving features.
-    In order to implement your own controller class the minimum requirement is to add a learner to the learner variable. And implement the next_parameters method, where you provide the appropriate information to the learner and get the next parameters.
-    See the RandomController for a simple implementation of a controller.
-    Note the first three keywords are all possible halting conditions for the controller. If any of them are satisfied the controller will halt (meaning an and condition is used).
-    Also creates an empty variable learner. The simplest way to make a working controller is to assign a learner of some kind to this variable, and add appropriate queues and events from it.
+    Abstract class for controllers.
+
+    The controller controls the entire M-LOOP process. The controllers for each
+    algorithm all inherit from this class. The class stores a variety of data
+    which all algorithms use and also includes all of the archiving and saving
+    features.
+    
+    In order to implement your own controller class the minimum requirement is
+    to add a learner to the learner variable and implement the
+    `next_parameters()` method where you provide the appropriate information to
+    the learner and get the next parameters. See the `RandomController` for a
+    simple implementation of a controller. Note the first three keywords are all
+    possible halting conditions for the controller. If any of them are satisfied
+    the controller will halt (meaning an OR condition is used). This base class
+    also creates an empty attribute `self.learner`. The simplest way to make a
+    working controller is to assign a learner of some kind to this variable, and
+    add appropriate queues and events from it.
+
     Args:
-        interface (interface): The interface process. Is run by learner.
+        interface (interface): The interface process. It is run by the
+            controller.
+
     Keyword Args:
-        max_num_runs (Optional [float]): The number of runs before the controller stops. If set to float('+inf') the controller will run forever. Default float('inf'), meaning the controller will run until another condition is met.
-        target_cost (Optional [float]): The target cost for the run. If a run achieves a cost lower than the target, the controller is stopped. Default float('-inf'), meaning the controller will run until another condition is met.
-        max_num_runs_without_better_params (Optional [float]): Puts a limit on the number of runs are allowed before a new better set of parameters is found. Default float('inf'), meaning the controller will run until another condition is met.
-        controller_archive_filename (Optional [string]): Filename for archive. Contains costs, parameter history and other details depending on the controller type. Default 'ControllerArchive.mat'
-        controller_archive_file_type (Optional [string]): File type for archive. Can be either 'txt' a human readable text file, 'pkl' a python dill file, 'mat' a matlab file or None if there is no archive. Default 'mat'.
-        archive_extra_dict (Optional [dict]): A dictionary with any extra variables that are to be saved to the archive. If None, nothing is added. Default None.
-        start_datetime (Optional datetime): Datetime for when controller was started.
+        max_num_runs (Optional [float]): The number of runs before the
+            controller stops. If set to `float('+inf')` the controller will run
+            forever assuming no other halting conditions are met. Default
+            `float('+inf')`, meaning the controller will run until another
+            halting condition is met.
+        target_cost (Optional [float]): The target cost for the run. If a run
+            achieves a cost lower than the target, the controller is stopped.
+            Default `float('-inf')`, meaning the controller will run until
+            another halting condition is met.
+        max_num_runs_without_better_params (Optional [float]): The optimization
+            will halt if the number of consecutive runs without improving over
+            the best measured value thus far exceeds this number. Default
+            `float('+inf')`, meaning the controller will run until another
+            halting condition is met.
+        max_duration (Optional [float]): The maximum duration of the
+            optimization, in seconds of wall time. The actual duration may
+            exceed this value slightly, but no new iterations will start after
+            `max_duration` seconds have elapsed since `start_datetime`. Default
+            is `float('+inf')`, meaning the controller will run until another
+            halting condition is met.
+        controller_archive_filename (Optional [string]): Filename for archive.
+            The archive contains costs, parameter history and other details
+            depending on the controller type. Default
+            `'controller_archive'`.
+        controller_archive_file_type (Optional [string]): File type for archive.
+            Can be either `'txt'` for a human readable text file, `'pkl'` for a
+            python pickle file, `'mat'` for a matlab file, or `None` to forgo
+            saving a controller archive. Default `'txt'`.
+        archive_extra_dict (Optional [dict]): A dictionary with any extra
+            variables that are to be saved to the archive. If `None`, nothing is
+            added. Default `None`.
+        start_datetime (Optional datetime): Datetime for when the controller was
+            started.
+
     Attributes:
-        params_out_queue (queue): Queue for parameters to next be run by experiment.
-        costs_in_queue (queue): Queue for costs (and other details) that have been returned by experiment.
-        end_interface (event): Event used to trigger the end of the interface
-        learner (None): The placeholder for the learner, creating this variable is the minimum requirement to make a working controller class.
-        learner_params_queue (queue): The parameters queue for the learner
-        learner_costs_queue (queue): The costs queue for the learner
-        end_learner (event): Event used to trigger the end of the learner
+        params_out_queue (queue): Queue for parameters to next be run by the
+            experiment.
+        costs_in_queue (queue): Queue for costs (and other details) that have
+            been returned by experiment.
+        interface_error_queue (queue): Queue for returning errors encountered by
+            the interface.
+        end_interface (event): Event used to trigger the end of the interface.
+        learner (None): The placeholder for the learner. Creating this variable
+            is the minimum requirement to make a working controller class.
+        learner_params_queue (queue): The parameters queue for the learner.
+        learner_costs_queue (queue): The costs queue for the learner.
+        end_learner (event): Event used to trigger the end of the learner.
         num_in_costs (int): Counter for the number of costs received.
         num_out_params (int): Counter for the number of parameters received.
         out_params (list): List of all parameters sent out by controller.
@@ -115,24 +164,27 @@ class Controller():
         best_index (float): The run number that produced the best cost.
     '''
 
-    def __init__(self, interface,
-                 max_num_runs = float('+inf'),
-                 target_cost = float('-inf'),
-                 max_num_runs_without_better_params = float('+inf'),
-                 controller_archive_filename=default_controller_archive_filename,
-                 controller_archive_file_type=default_controller_archive_file_type,
-                 archive_extra_dict = None,
-                 start_datetime = None,
-                 **kwargs):
+    def __init__(
+        self,
+        interface,
+        max_num_runs=float('+inf'),
+        target_cost=float('-inf'),
+        max_num_runs_without_better_params=float('+inf'),
+        max_duration=float('+inf'),
+        controller_archive_filename=default_controller_archive_filename,
+        controller_archive_file_type=default_controller_archive_file_type,
+        archive_extra_dict = None,
+        start_datetime = None,
+        **kwargs,
+    ):
 
-        #Make logger
-        self.remaining_kwargs = mlu._config_logger(**kwargs)
+        # Make the logger.
+        self.remaining_kwargs = mlu._config_logger(start_datetime=start_datetime, **kwargs)
         self.log = logging.getLogger(__name__)
 
-        #Variable that are included in archive
+        # Variables that are included in the controller archive.
         self.num_in_costs = 0
         self.num_out_params = 0
-        self.num_last_best_cost = 0
         self.out_params = []
         self.out_type = []
         self.out_extras = []
@@ -145,26 +197,28 @@ class Controller():
         self.best_index = float('nan')
         self.best_params = float('nan')
 
-        #Variables that used internally
+        # Variables that are used internally.
         self.last_out_params = None
         self.curr_params = None
         self.curr_cost = None
         self.curr_uncer = None
         self.curr_bad = None
         self.curr_extras = None
+        self.num_last_best_cost = 0
+        self.halt_reasons = []
 
-        #Constants
+        # Constants.
         self.controller_wait = float(1)
 
-        #Learner related variables
+        # Learner-related variables.
         self.learner_params_queue = None
         self.learner_costs_queue = None
         self.end_learner = None
         self.learner = None
 
-        #Variables set by user
+        # Variables set by user.
 
-        #save interface and extract important variables
+        # Store the interface and extract important attributes from it.
         if isinstance(interface, mli.Interface):
             self.interface = interface
         else:
@@ -173,22 +227,39 @@ class Controller():
 
         self.params_out_queue = interface.params_out_queue
         self.costs_in_queue = interface.costs_in_queue
+        self.interface_error_queue = interface.interface_error_queue
         self.end_interface = interface.end_event
 
-        #Other options
-        if start_datetime is None:
-            self.start_datetime = datetime.datetime.now()
-        else:
-            self.start_datetime = datetime.datetime(start_datetime)
+        # Halting options.
         self.max_num_runs = float(max_num_runs)
-        if self.max_num_runs<=0:
-            self.log.error('Number of runs must be greater than zero. max_num_runs:'+repr(self.max_num_run))
-            raise ValueError
+        if self.max_num_runs <= 0:
+            msg = f"max_num_runs must be greater than zero but was {max_num_runs}."
+            self.log.error(msg)
+            raise ValueError(msg)
         self.target_cost = float(target_cost)
         self.max_num_runs_without_better_params = float(max_num_runs_without_better_params)
-        if self.max_num_runs_without_better_params<=0:
-            self.log.error('Max number of repeats must be greater than zero. max_num_runs:'+repr(max_num_runs_without_better_params))
-            raise ValueError
+        if self.max_num_runs_without_better_params <= 0:
+            msg = f"max_num_runs_without_better_params must be greater than zero but was {max_num_runs_without_better_params}."
+            self.log.error(msg)
+            raise ValueError(msg)
+        self.max_duration = float(max_duration)
+        if self.max_duration <= 0:
+            msg = f"max_duration must be greater than zero but was {max_duration}."
+            self.log.error(msg)
+            raise ValueError(msg)
+
+        # Other options.
+        if start_datetime is None:
+            start_datetime = datetime.datetime.now()
+        if isinstance(start_datetime, datetime.datetime):
+            self.start_datetime = start_datetime
+        else:
+            msg = (
+                "start_datetime must be of type datetime.datetime but was "
+                f"{start_datetime} (type: {type(start_datetime)})."
+            )
+            self.log.error(msg)
+            raise ValueError(msg)
 
         if mlu.check_file_type_supported(controller_archive_file_type):
             self.controller_archive_file_type = controller_archive_file_type
@@ -236,11 +307,41 @@ class Controller():
 
     def check_end_conditions(self):
         '''
-        Check whether either of the three end contions have been met: number_of_runs, target_cost or max_num_runs_without_better_params.
+        Check whether any of the end contions have been met.
+
+        In particular this method check for any of the following conditions:
+
+        * If the number of iterations has reached `max_num_runs`.
+        * If the `target_cost` has been reached.
+        * If `max_num_runs_without_better_params` iterations in a row have
+          occurred without any improvement.
+        * If `max_duration` seconds or more has elapsed since `start_datetime`.
+
         Returns:
-            bool : True, if the controlled should continue, False if the controller should end.
+            bool: `True`, if the controller should continue or `False` if one or
+                more halting conditions have been met and the controller should
+                end.
         '''
-        return (self.num_in_costs < self.max_num_runs) and (self.best_cost > self.target_cost) and (self.num_last_best_cost < self.max_num_runs_without_better_params)
+        # Determine how long it has been since self.start_datetime.
+        duration = datetime.datetime.now() - self.start_datetime
+        duration = duration.total_seconds()  # Convert to seconds.
+
+        # Check all of the halting conditions. Many if statements are used
+        # instead of elif blocks so that we can mark if the optimization halted
+        # for more than one reason.
+        if self.num_in_costs >= self.max_num_runs:
+            self.halt_reasons.append('Maximum number of runs reached.')
+        if self.best_cost <= self.target_cost:
+            self.halt_reasons.append('Target cost reached.')
+        if self.num_last_best_cost >= self.max_num_runs_without_better_params:
+            self.halt_reasons.append(
+                'Maximum number of runs without better params reached.'
+            )
+        if duration > self.max_duration:
+            self.halt_reasons.append('Maximum duration reached.')
+        
+        # The optimization should only continue if self.halt_reasons is empty.
+        return not bool(self.halt_reasons)
 
     def _update_controller_with_learner_attributes(self):
         '''
@@ -250,22 +351,50 @@ class Controller():
         self.learner_costs_queue = self.learner.costs_in_queue
         self.end_learner = self.learner.end_event
         self.remaining_kwargs = self.learner.remaining_kwargs
+        self.num_params = self.learner.num_params
+        self.min_boundary = self.learner.min_boundary
+        self.max_boundary = self.learner.max_boundary
         self.param_names = self.learner.param_names
 
-        self.archive_dict.update({'num_params':self.learner.num_params,
-                                  'min_boundary':self.learner.min_boundary,
-                                  'max_boundary':self.learner.max_boundary,
-                                  'param_names':self.param_names})
+        self.archive_dict.update(
+            {
+                'num_params': self.num_params,
+                'min_boundary': self.min_boundary,
+                'max_boundary': self.max_boundary,
+                'param_names': self.param_names,
+            }
+        )
 
 
-    def _put_params_and_out_dict(self, params,  param_type=None, **kwargs):
+    def _put_params_and_out_dict(self, params, param_type=None, **kwargs):
         '''
-        Send parameters to queue and whatever additional keywords. Saves sent variables in appropriate storage arrays.
+        Send parameters to queue with optional additional keyword arguments.
+
+        This method also saves sent variables in appropriate storage arrays.
+
         Args:
-            params (array) : array of values to be sent to file
+            params (array): Array of values to be experimentally tested.
+            param_type (Optional, str): The learner type which generated the
+                parameter values. Because some learners use other learners as
+                trainers, the parameter type can be different for different
+                iterations during a given optimization. This value will be
+                stored in `self.out_type` and in the `out_type` list in the
+                controller archive. If `None`, then it will be set to
+                `self.learner.OUT_TYPE`. Default `None`.
         Keyword Args:
-            **kwargs: any additional data to be attached to file sent to experiment
+            **kwargs: Any additional keyword arguments will be stored in
+                `self.out_extras` and in the `out_extras` list in the controller
+                archive.
         '''
+        # Set default values if needed.
+        if param_type is None:
+            param_type = self.learner.OUT_TYPE
+
+        # Do one last check to ensure parameter values are within the allowed
+        # limits before sending those values to the interface.
+        params = self._enforce_boundaries(params)
+
+        # Send the parameters to the interface and update various attributes.
         out_dict = {'params':params}
         out_dict.update(kwargs)
         self.params_out_queue.put(out_dict)
@@ -273,22 +402,115 @@ class Controller():
         self.last_out_params = params
         self.out_params.append(params)
         self.out_extras.append(kwargs)
-        if param_type is not None:
-            self.out_type.append(param_type)
+        self.out_type.append(param_type)
         self.log.info('params ' + str(params))
         #self.log.debug('Put params num:' + repr(self.num_out_params ))
 
+    def _enforce_boundaries(self, params):
+        '''
+        Enforce the minimum and maximum parameter boundaries.
+
+        If the values in params extend outside of the allowed boundaries set by
+        `self.min_boundary` and `self.max_boundary` by a nontrivial amount, then
+        this method will raise an `RuntimeError`.
+
+        To avoid numerical precision problems, this method actually gently clips
+        values which barely exceed the boundaries. This is because variables are
+        internally scaled and thus may very slightly violate the boundaries
+        after being unscaled. If a parameter's value only slightly exceeds the
+        boundaries, then its value will be set equal to the boundary. If a value
+        exceeds the boundary by a nontrivial amount, then a `RuntimeError` will
+        be raised.
+
+        Note that although this method is forgiving about input parameter values
+        very slightly exceeding the boundaries, it is completely strict about
+        returning parameter values which obey the boundaries. Thus it is safe to
+        assume that the returned values are within the range set by
+        `self.min_boundary` and `self.max_boundary` (inclusively).
+
+        Args:
+            params (array): Array of values to be experimentally tested.
+
+        Raises:
+            RuntimeError: A `RuntimeError` is raised if any value in `params`
+                exceeds the parameter value boundaries by a nontrivial amount.
+
+        Returns:
+            array: The input `params`, except that any values which slightly
+                exceed the boundaries will have been clipped to stay within the
+                boundaries exactly.
+        '''
+        # Check for any values barely below the minimum boundary.
+        is_below = (params < self.min_boundary)
+        is_close = np.isclose(params, self.min_boundary)
+        barely_below = np.logical_and(is_below, is_close)
+        # The line below leaves most params entries untouched. It just takes the
+        # ones which are barely below the boundary and moves them up to the
+        # minimum boundary.
+        params = np.where(barely_below, self.min_boundary, params)
+
+        # Perform a similar procedure for the maximum boundary.
+        is_above = (params > self.max_boundary)
+        is_close = np.isclose(params, self.max_boundary)
+        barely_above = np.logical_and(is_above, is_close)
+        params = np.where(barely_above, self.max_boundary, params)
+
+        # Ensure that all values are within the boundaries now. If a parameter
+        # was well outside the boundaries then the above should not have changed
+        # its value and the checks below will be violated.
+        if not np.all(params >= self.min_boundary):
+            msg = (
+                f"Minimum boundary violated. Parameter values are {params}, "
+                f"minimum bounday is {self.min_boundary}, and "
+                f"(params - boundary) is {params - self.min_boundary}."
+            )
+            self.log.error(msg)
+            raise RuntimeError(msg)
+        if not np.all(params <= self.max_boundary):
+            msg = (
+                f"Maximum boundary violated. Parameter values are {params}, "
+                f"maximum bounday is {self.min_boundary}, and "
+                f"(boundary - params) is {self.max_boundary - params})."
+            )
+            self.log.error(msg)
+            raise RuntimeError(msg)
+
+        return params
+
     def _get_cost_and_in_dict(self):
         '''
-        Get cost, uncertainty, parameters, bad and extra data from experiment. Stores in a list of history and also puts variables in their appropriate 'current' variables
-        Note returns nothing, stores everything in the internal storage arrays and the curr_variables
+        Get cost, uncertainty, parameters, bad and extra data from experiment.
+
+        This method stores results in lists and also puts data in the
+        appropriate 'current' variables. This method doesn't return anything and
+        instead stores all of its results in the internal storage arrays and the
+        'current' variables.
+        
+        If the interface encounters an error, it will pass the error to the
+        controller here so that the error can be re-raised in the controller's
+        thread (note that the interface runs in a separate thread).
         '''
         while True:
             try:
                 in_dict = self.costs_in_queue.get(True, self.controller_wait)
             except mlu.empty_exception:
-                continue
+                # Check for an error from the interface.
+                try:
+                    err = self.interface_error_queue.get_nowait()
+                except mlu.empty_exception:
+                    # The interface didn't send an error, so go back to waiting
+                    # for results.
+                    continue
+                else:
+                    # Log and re-raise the error sent by the interface.
+                    msg = 'The interface raised an error with traceback:\n'
+                    msg = msg + '\n'.join(
+                        traceback.format_tb(err.__traceback__),
+                    )
+                    self.log.error(msg)
+                    raise err
             else:
+                # Got a cost dict, so exit this while loop.
                 break
 
         self.num_in_costs += 1
@@ -363,6 +585,7 @@ class Controller():
             log.warning('Closing down controller.')
         except Exception:
             self.log.warning('Controller ended due to exception of some kind. Starting shut down...')
+            self.halt_reasons.append('Error occurred.')
             self._shut_down()
             self.log.warning('Safely shut down. Below are results found before exception.')
             self.print_results()
@@ -399,17 +622,13 @@ class Controller():
         '''
         Print results from optimization run to the logs
         '''
-        self.log.info('Optimization ended because:-')
-        if self.num_in_costs >= self.max_num_runs:
-            self.log.info('Maximum number of runs reached.')
-        if self.best_cost <= self.target_cost:
-            self.log.info('Target cost reached.')
-        if self.num_last_best_cost >= self.max_num_runs_without_better_params:
-            self.log.info('Maximum number of runs without better params reached.')
-        self.log.info('Results:-')
-        self.log.info('Best parameters found:' + str(self.best_params))
-        self.log.info('Best cost returned:' + str(self.best_cost) + ' +/- ' + str(self.best_uncer))
-        self.log.info('Best run number:' + str(self.best_index))
+        self.log.info('Optimization ended because:')
+        for reason in self.halt_reasons:
+            self.log.info('\t* ' + reason)
+        self.log.info('Results:')
+        self.log.info('\t* Best parameters found:' + str(self.best_params))
+        self.log.info('\t* Best cost returned:' + str(self.best_cost) + ' +/- ' + str(self.best_uncer))
+        self.log.info('\t* Best run number:' + str(self.best_index))
 
     def _optimization_routine(self):
         '''
@@ -418,13 +637,19 @@ class Controller():
         self.log.debug('Start controller loop.')
         self.log.info('Run:' + str(self.num_in_costs +1))
         next_params = self._first_params()
-        self._put_params_and_out_dict(next_params)
+        self._put_params_and_out_dict(
+            next_params,
+            param_type=self.learner.OUT_TYPE,
+        )
         self.save_archive()
         self._get_cost_and_in_dict()
         while self.check_end_conditions():
             self.log.info('Run:' + str(self.num_in_costs +1))
             next_params = self._next_params()
-            self._put_params_and_out_dict(next_params)
+            self._put_params_and_out_dict(
+                next_params,
+                param_type=self.learner.OUT_TYPE,
+            )
             self.save_archive()
             self._get_cost_and_in_dict()
         self.log.debug('End controller loop.')
@@ -434,7 +659,8 @@ class Controller():
 
     def _first_params(self):
         '''
-        Checks queue to get first  parameters.
+        Checks queue to get the first parameters.
+
         Returns:
             Parameters for first experiment
         '''
@@ -478,7 +704,6 @@ class RandomController(Controller):
                                          **self.remaining_kwargs)
 
         self._update_controller_with_learner_attributes()
-        self.out_type.append('random')
 
         self.log.debug('Random controller init completed.')
 
@@ -499,7 +724,6 @@ class NelderMeadController(Controller):
                                              **self.remaining_kwargs)
 
         self._update_controller_with_learner_attributes()
-        self.out_type.append('nelder_mead')
 
 
 class DifferentialEvolutionController(Controller):
@@ -518,7 +742,6 @@ class DifferentialEvolutionController(Controller):
                                                         **self.remaining_kwargs)
 
         self._update_controller_with_learner_attributes()
-        self.out_type.append('differential_evolution')
 
 
 class MachineLearnerController(Controller):
@@ -535,7 +758,6 @@ class MachineLearnerController(Controller):
 
     def __init__(self, interface,
                  training_type='differential_evolution',
-                 machine_learner_type='machine_learner',
                  num_training_runs=None,
                  no_delay=True,
                  num_params=None,
@@ -548,11 +770,6 @@ class MachineLearnerController(Controller):
                  **kwargs):
 
         super(MachineLearnerController,self).__init__(interface, **kwargs)
-        self.machine_learner_type = machine_learner_type
-
-        self.last_training_cost = None
-        self.last_training_bad = None
-        self.last_training_run_flag = False
 
         if num_training_runs is None:
             if num_params is None:
@@ -616,23 +833,14 @@ class MachineLearnerController(Controller):
         self.remaining_kwargs = self.ml_learner.remaining_kwargs
         self.generation_num = self.ml_learner.generation_num
 
-
-    def _put_params_and_out_dict(self, params):
-        '''
-        Override _put_params_and_out_dict function, used when the training learner creates parameters. Makes the default param_type the training type and sets last_training_run_flag.
-        '''
-        super(MachineLearnerController,self)._put_params_and_out_dict(params, param_type=self.training_type)
-        self.last_training_run_flag = True
-
     def _get_cost_and_in_dict(self):
         '''
-        Call _get_cost_and_in_dict() of parent Controller class. But also sends cost to machine learning learner and saves the cost if the parameters came from a trainer.
+        Get cost, uncertainty, parameters, bad, and extra data from experiment.
+        
+        This method calls `_get_cost_and_in_dict()` of the parent `Controller`
+        class and additionally sends the results to machine learning learner.
         '''
         super(MachineLearnerController,self)._get_cost_and_in_dict()
-        if self.last_training_run_flag:
-            self.last_training_cost = self.curr_cost
-            self.last_training_bad = self.curr_bad
-            self.last_training_run_flag = False
         self.ml_learner_costs_queue.put((self.curr_params,
                                          self.curr_cost,
                                          self.curr_uncer,
@@ -654,14 +862,20 @@ class MachineLearnerController(Controller):
         self.log.debug('Starting training optimization.')
         self.log.info('Run:' + str(self.num_in_costs +1) + ' (training)')
         next_params = self._first_params()
-        self._put_params_and_out_dict(next_params)
+        self._put_params_and_out_dict(
+            next_params,
+            param_type=self.learner.OUT_TYPE,
+        )
         self.save_archive()
         self._get_cost_and_in_dict()
 
         while (self.num_in_costs < self.num_training_runs) and self.check_end_conditions():
             self.log.info('Run:' + str(self.num_in_costs +1) + ' (training)')
             next_params = self._next_params()
-            self._put_params_and_out_dict(next_params)
+            self._put_params_and_out_dict(
+                next_params,
+                param_type=self.learner.OUT_TYPE,
+            )
             self.save_archive()
             self._get_cost_and_in_dict()
 
@@ -669,7 +883,10 @@ class MachineLearnerController(Controller):
             #Start last training run
             self.log.info('Run:' + str(self.num_in_costs +1) + ' (training)')
             next_params = self._next_params()
-            self._put_params_and_out_dict(next_params)
+            self._put_params_and_out_dict(
+                next_params,
+                param_type=self.learner.OUT_TYPE,
+            )
 
             self.log.debug('Starting ML optimization.')
             # This may be a race. Although the cost etc. is put in the queue to
@@ -691,12 +908,18 @@ class MachineLearnerController(Controller):
             if ml_consec==self.generation_num or (self.no_delay and self.ml_learner_params_queue.empty()):
                 self.log.info('Run:' + str(run_num) + ' (trainer)')
                 next_params = self._next_params()
-                self._put_params_and_out_dict(next_params)
+                self._put_params_and_out_dict(
+                    next_params,
+                    param_type=self.learner.OUT_TYPE,
+                )
                 ml_consec = 0
             else:
                 self.log.info('Run:' + str(run_num) + ' (machine learner)')
                 next_params = self.ml_learner_params_queue.get()
-                super(MachineLearnerController,self)._put_params_and_out_dict(next_params, param_type=self.machine_learner_type)
+                self._put_params_and_out_dict(
+                    next_params,
+                    param_type=self.ml_learner.OUT_TYPE,
+                )
                 ml_consec += 1
                 ml_count += 1
 
@@ -706,8 +929,6 @@ class MachineLearnerController(Controller):
             if ml_count==self.generation_num:
                 self.new_params_event.set()
                 ml_count = 0
-
-
 
     def _shut_down(self):
         '''
@@ -747,16 +968,16 @@ class MachineLearnerController(Controller):
         '''
         super(MachineLearnerController,self).print_results()
         try:
-            self.log.info('Predicted best parameters:' + str(self.predicted_best_parameters))
+            self.log.info('\t* Predicted best parameters:' + str(self.predicted_best_parameters))
             try:
                 errorstring = ' +/- ' + str(self.predicted_best_uncertainty)
             except AttributeError:
                 errorstring = ''
-            self.log.info('Predicted best cost:' + str(self.predicted_best_cost) + errorstring)
+            self.log.info('\t* Predicted best cost:' + str(self.predicted_best_cost) + errorstring)
         except AttributeError:
             pass
         try:
-            self.log.info('Predicted number of local minima:' + str(self.number_of_local_minima))
+            self.log.info('\t* Predicted number of local minima:' + str(self.number_of_local_minima))
         except AttributeError:
             pass
 
@@ -769,36 +990,42 @@ class GaussianProcessController(MachineLearnerController):
     Keyword Args:
     '''
 
-    def __init__(self, interface,
-                 num_params=None,
-                 min_boundary=None,
-                 max_boundary=None,
-                 trust_region=None,
-                 learner_archive_filename = mll.default_learner_archive_filename,
-                 learner_archive_file_type = mll.default_learner_archive_file_type,
-                 param_names=None,
-                 **kwargs):
+    def __init__(
+        self,
+        interface,
+        num_params=None,
+        min_boundary=None,
+        max_boundary=None,
+        trust_region=None,
+        learner_archive_filename = mll.default_learner_archive_filename,
+        learner_archive_file_type = mll.default_learner_archive_file_type,
+        param_names=None,
+        **kwargs,
+    ):
 
-        super(GaussianProcessController,self).__init__(interface,
-                                                       machine_learner_type='gaussian_process',
-                                                       num_params=num_params,
-                                                       min_boundary=min_boundary,
-                                                       max_boundary=max_boundary,
-                                                       trust_region=trust_region,
-                                                       learner_archive_filename=learner_archive_filename,
-                                                       learner_archive_file_type=learner_archive_file_type,
-                                                       param_names=param_names,
-                                                       **kwargs)
+        super(GaussianProcessController,self).__init__(
+            interface,
+            num_params=num_params,
+            min_boundary=min_boundary,
+            max_boundary=max_boundary,
+            trust_region=trust_region,
+            learner_archive_filename=learner_archive_filename,
+            learner_archive_file_type=learner_archive_file_type,
+            param_names=param_names,
+            **kwargs,
+        )
 
-        self.ml_learner = mll.GaussianProcessLearner(start_datetime=self.start_datetime,
-                                                     num_params=num_params,
-                                                     min_boundary=min_boundary,
-                                                     max_boundary=max_boundary,
-                                                     trust_region=trust_region,
-                                                     learner_archive_filename=learner_archive_filename,
-                                                     learner_archive_file_type=learner_archive_file_type,
-                                                     param_names=param_names,
-                                                     **self.remaining_kwargs)
+        self.ml_learner = mll.GaussianProcessLearner(
+            start_datetime=self.start_datetime,
+            num_params=num_params,
+            min_boundary=min_boundary,
+            max_boundary=max_boundary,
+            trust_region=trust_region,
+            learner_archive_filename=learner_archive_filename,
+            learner_archive_file_type=learner_archive_file_type,
+            param_names=param_names,
+            **self.remaining_kwargs,
+        )
 
         self._update_controller_with_machine_learner_attributes()
 
@@ -811,35 +1038,41 @@ class NeuralNetController(MachineLearnerController):
     Keyword Args:
     '''
 
-    def __init__(self, interface,
-                 num_params=None,
-                 min_boundary=None,
-                 max_boundary=None,
-                 trust_region=None,
-                 learner_archive_filename = mll.default_learner_archive_filename,
-                 learner_archive_file_type = mll.default_learner_archive_file_type,
-                 param_names=None,
-                 **kwargs):
+    def __init__(
+        self,
+        interface,
+        num_params=None,
+        min_boundary=None,
+        max_boundary=None,
+        trust_region=None,
+        learner_archive_filename = mll.default_learner_archive_filename,
+        learner_archive_file_type = mll.default_learner_archive_file_type,
+        param_names=None,
+        **kwargs,
+    ):
 
-        super(NeuralNetController,self).__init__(interface,
-                                                machine_learner_type='neural_net',
-                                                num_params=num_params,
-                                                min_boundary=min_boundary,
-                                                max_boundary=max_boundary,
-                                                trust_region=trust_region,
-                                                learner_archive_filename=learner_archive_filename,
-                                                learner_archive_file_type=learner_archive_file_type,
-                                                param_names=param_names,
-                                                **kwargs)
+        super(NeuralNetController,self).__init__(
+            interface,
+            num_params=num_params,
+            min_boundary=min_boundary,
+            max_boundary=max_boundary,
+            trust_region=trust_region,
+            learner_archive_filename=learner_archive_filename,
+            learner_archive_file_type=learner_archive_file_type,
+            param_names=param_names,
+            **kwargs,
+        )
 
-        self.ml_learner = mll.NeuralNetLearner(start_datetime=self.start_datetime,
-                                               num_params=num_params,
-                                               min_boundary=min_boundary,
-                                               max_boundary=max_boundary,
-                                               trust_region=trust_region,
-                                               learner_archive_filename=learner_archive_filename,
-                                               learner_archive_file_type=learner_archive_file_type,
-                                               param_names=param_names,
-                                               **self.remaining_kwargs)
+        self.ml_learner = mll.NeuralNetLearner(
+            start_datetime=self.start_datetime,
+            num_params=num_params,
+            min_boundary=min_boundary,
+            max_boundary=max_boundary,
+            trust_region=trust_region,
+            learner_archive_filename=learner_archive_filename,
+            learner_archive_file_type=learner_archive_file_type,
+            param_names=param_names,
+            **self.remaining_kwargs,
+        )
 
         self._update_controller_with_machine_learner_attributes()

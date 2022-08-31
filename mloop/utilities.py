@@ -5,13 +5,13 @@ from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
 import scipy.io as si
+import sklearn.preprocessing as skp
 import pickle
 import logging
 import datetime
 import sys
 import os
 import numpy as np
-import numpy.random as nr
 import base64
 import mloop
 
@@ -19,8 +19,8 @@ python_version = sys.version_info[0]
 
 #For libraries with different names in pythons 2 and 3
 if python_version < 3:
-    import Queue #@UnresolvedImport @UnusedImport
-    empty_exception = Queue.Empty
+    import Queue as queue  #@UnresolvedImport @UnusedImport
+    empty_exception = queue.Empty
 else:
     import queue
     empty_exception = queue.Empty
@@ -41,6 +41,12 @@ mloop_path = os.path.dirname(mloop.__file__)
 #Set numpy to have no limit on printing to ensure all values are saved
 np.set_printoptions(threshold=np.inf)
 
+# Create a random number generator that can be used throughout M-LOOP. Users
+# could also seed this generator if they want to fix the random numbers
+# generated in M-LOOP (though this won't affect the generators used by M-LOOP
+# dependencies, such as tensorflow).
+rng = np.random.default_rng()
+
 def config_logger(**kwargs):
     '''
     Wrapper for _config_logger.
@@ -50,6 +56,7 @@ def config_logger(**kwargs):
 def _config_logger(log_filename = default_log_filename,
                   file_log_level=logging.DEBUG,
                   console_log_level=logging.INFO,
+                  start_datetime=None,
                   **kwargs):
     '''
     Configure and the root logger.
@@ -58,6 +65,11 @@ def _config_logger(log_filename = default_log_filename,
         log_filename (Optional [string]) : Filename prefix for log. Default M-LOOP run . If None, no file handler is created
         file_log_level (Optional[int]) : Level of log output for file, default is logging.DEBUG = 10
         console_log_level (Optional[int]) :Level of log output for console, default is logging.INFO = 20
+        start_datetime (Optional datetime.datetime): The date and time to use in
+            the filename suffix, represented as an instance of the datetime
+            class defined in the datetime module. If set to None, then this
+            function will use the result returned by datetime.datetime.now().
+            Default None.
     
     Returns:
         dictionary: Dict with extra keywords not used by the logging configuration.
@@ -67,7 +79,7 @@ def _config_logger(log_filename = default_log_filename,
     if len(log.handlers) == 0:
         log.setLevel(min(file_log_level,console_log_level))
         if log_filename is not None:
-            filename_suffix = generate_filename_suffix('log')
+            filename_suffix = generate_filename_suffix('log', start_datetime)
             full_filename = log_filename + filename_suffix
             filename_with_path = os.path.join(log_foldername, full_filename)
             # Create folder if it doesn't exist, accounting for any parts of the
@@ -124,7 +136,7 @@ def generate_filename_suffix(file_type, file_datetime=None, random_bytes=False):
     date_string = datetime_to_string(file_datetime)
     filename_suffix = '_' + date_string 
     if random_bytes:
-        random_string = base64.urlsafe_b64encode(nr.bytes(6)).decode()
+        random_string = base64.urlsafe_b64encode(rng.bytes(6)).decode()
         filename_suffix = filename_suffix + '_' + random_string
     filename_suffix = filename_suffix + '.' + file_type
     return filename_suffix
@@ -287,6 +299,8 @@ def get_controller_type_from_learner_archive(learner_filename):
         'gaussian_process_learner': 'gaussian_process',
         'neural_net_learner': 'neural_net',
         'differential_evolution': 'differential_evolution',
+        'random_learner': 'random',
+        'nelder_mead_learner': 'nelder_mead',
     }
     if archive_type in ARCHIVE_CONTROLLER_MAPPING:
         controller_type = ARCHIVE_CONTROLLER_MAPPING[archive_type]
@@ -464,6 +478,42 @@ class NullQueueListener():
         '''
         pass
 
+class ParameterScaler(skp.MinMaxScaler):
+    '''
+    Class for scaling parameters based on their min/max value constraints.
+
+    All parameters are mapped (by default) between [0, 1] by linearly rescaling them,
+    In particular the minimum value for a parameter is mapped to 0 and the maximum
+    value is mapped to 1.
+
+    This class inherits from scikit-learn's `MinMaxScaler`. The primary difference is that
+    values are scaled by the minimum and maximum values set by the user, rather
+    than the minimum and maximum values actually used in a dataset.
+
+    Args:
+        min_boundary (np.array): The minimum values allowed for each parameter.
+        max_boundary (np.array): The maximum values allowed for each parameter.
+        *args: Additional arguments are passed to `MinMaxScaler.__init__()`.
+        **kwargs: Arbitrary keyword arguments are passed to `MinMaxScaler.__init__()`.
+    '''
+    def __init__(self, min_boundary, max_boundary, *args, **kwargs):
+        if len(min_boundary) != len(max_boundary):
+            raise ValueError(
+                "The minimum and maximum boundary arrays must have the same lengths but "
+                f"min_boundary had length {len(min_boundary)} while max_boundary had length "
+                f" {len(max_boundary)}."
+            )
+
+        self.min_boundary = min_boundary
+        self.max_boundary = max_boundary
+        return super().__init__(*args, **kwargs)
+
+    def partial_fit(self, X=None, *args, **kwargs):
+        '''
+        Teach the scaler that we want to scale things based on the minimum and maximum boundaries
+        '''
+        X = [self.min_boundary, self.max_boundary]
+        return super().partial_fit(X,*args, **kwargs)
 
 
     
